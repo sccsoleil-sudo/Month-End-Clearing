@@ -58,6 +58,15 @@ export interface ActionSummary {
   type: ActionType;
   count: number;
   amount: number;
+  /** Amount by aging bucket id. */
+  byAging: Record<string, { count: number; amount: number }>;
+}
+
+export interface AgingSummary {
+  id: string;
+  label: string;
+  count: number;
+  amount: number;
 }
 
 export interface ClientSummary {

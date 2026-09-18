@@ -56,3 +56,15 @@ export const ACTION_ORDER = [
 /** R02 / R03 low-value → machine proposes write-off. */
 export const WRITE_OFF_THRESHOLD_REASONS = new Set(['R02', 'R03']);
 
+/** Header aging buckets (days in arrears). */
+export const AGING_BUCKETS = [
+  { id: 'NOT_DUE', label: 'Not due (< 0)', min: Number.NEGATIVE_INFINITY, max: 0 },
+  { id: '0_30', label: '0–30', min: 0, max: 30 },
+  { id: '31_60', label: '31–60', min: 30, max: 60 },
+  { id: '61_90', label: '61–90', min: 60, max: 90 },
+  { id: '90_120', label: '90–120', min: 90, max: 120 },
+  { id: '120_PLUS', label: '120+', min: 120, max: Number.POSITIVE_INFINITY },
+] as const;
+
+export type AgingBucketId = (typeof AGING_BUCKETS)[number]['id'];
+

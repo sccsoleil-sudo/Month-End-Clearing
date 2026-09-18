@@ -1,14 +1,17 @@
 import {
   ACTION_ORDER,
+  AGING_BUCKETS,
   PMT_CODE,
   REFUSE_PREFIX,
   WRITE_OFF_CONTAINS,
   WRITE_OFF_THRESHOLD_REASONS,
+  type AgingBucketId,
 } from '../config/rules';
 import { hasActiveDisputeStatus, normalizeCode } from './classify';
 import type {
   ActionSummary,
   ActionType,
+  AgingSummary,
   ClientSummary,
   LineItem,
   Proposal,
@@ -18,6 +21,21 @@ import type {
 function ageOf(row: LineItem): number {
   return row.daysInArrears ?? 0;
 }
+
+export function agingBucketId(daysInArrears: number | null): AgingBucketId {
+  const d = daysInArrears ?? 0;
+  for (const b of AGING_BUCKETS) {
+    // [min, max) except last bucket which is [min, +∞)
+    if (d >= b.min && d < b.max) return b.id;
+    if (b.max === Number.POSITIVE_INFINITY && d >= b.min) return b.id;
+  }
+  return '0_30';
+}
+
+export function agingBucketLabel(id: string): string {
+  return AGING_BUCKETS.find((b) => b.id === id)?.label ?? id;
+}
+
 
 function isWo(rk2: string): boolean {
   return normalizeCode(rk2).includes(WRITE_OFF_CONTAINS);
@@ -172,15 +190,35 @@ export function buildProposals(items: LineItem[], options: ProposalOptions): Pro
 export function headerByAction(proposals: Proposal[]): ActionSummary[] {
   const map = new Map<ActionType, ActionSummary>();
   for (const type of ACTION_ORDER) {
-    map.set(type, { type, count: 0, amount: 0 });
+    map.set(type, { type, count: 0, amount: 0, byAging: {} });
   }
   for (const p of proposals) {
-    const cur = map.get(p.type) ?? { type: p.type, count: 0, amount: 0 };
+    const cur = map.get(p.type) ?? { type: p.type, count: 0, amount: 0, byAging: {} };
     cur.count += 1;
     cur.amount += p.amount;
+    const bucket = agingBucketId(p.daysInArrears);
+    const aging = cur.byAging[bucket] ?? { count: 0, amount: 0 };
+    aging.count += 1;
+    aging.amount += p.amount;
+    cur.byAging[bucket] = aging;
     map.set(p.type, cur);
   }
   return ACTION_ORDER.map((t) => map.get(t)!).filter((s) => s.count > 0);
+}
+
+/** Header aging totals across all filtered proposals. */
+export function headerByAging(proposals: Proposal[]): AgingSummary[] {
+  const map = new Map<string, AgingSummary>();
+  for (const b of AGING_BUCKETS) {
+    map.set(b.id, { id: b.id, label: b.label, count: 0, amount: 0 });
+  }
+  for (const p of proposals) {
+    const id = agingBucketId(p.daysInArrears);
+    const cur = map.get(id)!;
+    cur.count += 1;
+    cur.amount += p.amount;
+  }
+  return AGING_BUCKETS.map((b) => map.get(b.id)!).filter((s) => s.count > 0);
 }
 
 export function summarizeByClient(proposals: Proposal[]): ClientSummary[] {

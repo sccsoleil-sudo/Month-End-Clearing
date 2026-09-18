@@ -1,10 +1,17 @@
 import { useMemo, useState } from 'react';
 import * as XLSX from 'xlsx';
-import { ACTION_ORDER, DEFAULT_AGING_DAYS, DEFAULT_THRESHOLD } from './config/rules';
+import {
+  ACTION_ORDER,
+  AGING_BUCKETS,
+  DEFAULT_AGING_DAYS,
+  DEFAULT_THRESHOLD,
+} from './config/rules';
 import { parseWorkbook } from './lib/parseWorkbook';
 import {
+  agingBucketId,
   buildProposals,
   headerByAction,
+  headerByAging,
   summarize,
   summarizeByClient,
 } from './lib/propose';
@@ -25,6 +32,7 @@ function labelAction(type: ActionType): string {
 function exportWorkbook(
   proposals: Proposal[],
   header: ReturnType<typeof headerByAction>,
+  aging: ReturnType<typeof headerByAging>,
   clients: ReturnType<typeof summarizeByClient>,
   filename: string,
 ) {
@@ -32,13 +40,31 @@ function exportWorkbook(
   XLSX.utils.book_append_sheet(
     wb,
     XLSX.utils.json_to_sheet(
-      header.map((h) => ({
-        Action: labelAction(h.type),
-        Lines: h.count,
-        Amount: h.amount,
+      aging.map((a) => ({
+        Aging: a.label,
+        Lines: a.count,
+        Amount: a.amount,
       })),
     ),
-    'Header',
+    'Header Aging',
+  );
+  XLSX.utils.book_append_sheet(
+    wb,
+    XLSX.utils.json_to_sheet(
+      header.map((h) => {
+        const row: Record<string, string | number> = {
+          Action: labelAction(h.type),
+          Lines: h.count,
+          Amount: h.amount,
+        };
+        for (const b of AGING_BUCKETS) {
+          row[`${b.label} $`] = h.byAging[b.id]?.amount ?? 0;
+          row[`${b.label} #`] = h.byAging[b.id]?.count ?? 0;
+        }
+        return row;
+      }),
+    ),
+    'Header Action',
   );
   XLSX.utils.book_append_sheet(
     wb,
@@ -73,6 +99,7 @@ function exportWorkbook(
         Assignment: p.assignment,
         Amount: p.amount,
         'Days in Arrears': p.daysInArrears ?? '',
+        Aging: AGING_BUCKETS.find((b) => b.id === agingBucketId(p.daysInArrears))?.label ?? '',
         Category: p.category,
         'Reference Key 2': p.referenceKey2,
         'Dispute Status': p.disputeStatus,
@@ -95,8 +122,8 @@ export default function App() {
   const [agingDays, setAgingDays] = useState(DEFAULT_AGING_DAYS);
   const [reasons, setReasons] = useState<string[]>([...REASON_OPTIONS]);
   const [divisionFilter, setDivisionFilter] = useState('ALL');
-  const [reasonFilter, setReasonFilter] = useState('ALL');
-  const [actionFilter, setActionFilter] = useState<ActionType | 'ALL'>('ALL');
+  const [actionFilters, setActionFilters] = useState<ActionType[]>([...ACTION_ORDER]);
+  const [agingFilter, setAgingFilter] = useState<string>('ALL');
   const [view, setView] = useState<ViewMode>('header');
   const [over, setOver] = useState(false);
 
@@ -134,19 +161,22 @@ export default function App() {
   const filtered = useMemo(() => {
     return proposals.filter((p) => {
       if (divisionFilter !== 'ALL' && p.division !== divisionFilter) return false;
-      if (reasonFilter !== 'ALL' && p.reasonCode !== reasonFilter) return false;
-      if (actionFilter !== 'ALL' && p.type !== actionFilter) return false;
+      if (!reasons.includes(p.reasonCode)) return false;
+      if (actionFilters.length > 0 && !actionFilters.includes(p.type)) return false;
+      if (agingFilter !== 'ALL' && agingBucketId(p.daysInArrears) !== agingFilter) return false;
       return true;
     });
-  }, [proposals, divisionFilter, reasonFilter, actionFilter]);
+  }, [proposals, divisionFilter, reasons, actionFilters, agingFilter]);
 
   const header = useMemo(() => headerByAction(filtered), [filtered]);
+  const agingHeader = useMemo(() => headerByAging(filtered), [filtered]);
   const clients = useMemo(() => summarizeByClient(filtered), [filtered]);
   const stats = useMemo(
-    () => summarize(
-      items.filter((i) => reasons.includes(i.reasonCode)),
-      filtered,
-    ),
+    () =>
+      summarize(
+        items.filter((i) => reasons.includes(i.reasonCode)),
+        filtered,
+      ),
     [items, reasons, filtered],
   );
 
@@ -156,9 +186,31 @@ export default function App() {
   }, [items]);
 
   function toggleReason(code: string) {
-    setReasons((prev) =>
-      prev.includes(code) ? prev.filter((c) => c !== code) : [...prev, code],
-    );
+    setReasons((prev) => {
+      if (prev.includes(code)) {
+        if (prev.length === 1) return prev; // keep at least one
+        return prev.filter((c) => c !== code);
+      }
+      return [...prev, code];
+    });
+  }
+
+  function toggleAction(type: ActionType) {
+    setActionFilters((prev) => {
+      if (prev.includes(type)) {
+        if (prev.length === 1) return prev;
+        return prev.filter((t) => t !== type);
+      }
+      return [...prev, type];
+    });
+  }
+
+  function selectAllActions() {
+    setActionFilters([...ACTION_ORDER]);
+  }
+
+  function selectAllReasons() {
+    setReasons([...REASON_OPTIONS]);
   }
 
   return (
@@ -253,17 +305,46 @@ export default function App() {
                 />
               </label>
 
-              <div className="chips">
-                {REASON_OPTIONS.map((code) => (
-                  <button
-                    key={code}
-                    type="button"
-                    className={`chip${reasons.includes(code) ? ' on' : ''}`}
-                    onClick={() => toggleReason(code)}
-                  >
-                    {code}
+              <div className="filter-group">
+                <span className="filter-label">
+                  Reason code
+                  <button type="button" className="linkish" onClick={selectAllReasons}>
+                    All
                   </button>
-                ))}
+                </span>
+                <div className="chips">
+                  {REASON_OPTIONS.map((code) => (
+                    <button
+                      key={code}
+                      type="button"
+                      className={`chip${reasons.includes(code) ? ' on' : ''}`}
+                      onClick={() => toggleReason(code)}
+                    >
+                      {code}
+                    </button>
+                  ))}
+                </div>
+              </div>
+
+              <div className="filter-group">
+                <span className="filter-label">
+                  Action
+                  <button type="button" className="linkish" onClick={selectAllActions}>
+                    All
+                  </button>
+                </span>
+                <div className="chips wrap">
+                  {ACTION_ORDER.map((t) => (
+                    <button
+                      key={t}
+                      type="button"
+                      className={`chip${actionFilters.includes(t) ? ' on' : ''}`}
+                      onClick={() => toggleAction(t)}
+                    >
+                      {labelAction(t)}
+                    </button>
+                  ))}
+                </div>
               </div>
 
               <label className="field">
@@ -278,27 +359,12 @@ export default function App() {
               </label>
 
               <label className="field">
-                Reason
-                <select value={reasonFilter} onChange={(e) => setReasonFilter(e.target.value)}>
+                Aging bucket
+                <select value={agingFilter} onChange={(e) => setAgingFilter(e.target.value)}>
                   <option value="ALL">ALL</option>
-                  {REASON_OPTIONS.map((c) => (
-                    <option key={c} value={c}>
-                      {c}
-                    </option>
-                  ))}
-                </select>
-              </label>
-
-              <label className="field">
-                Action
-                <select
-                  value={actionFilter}
-                  onChange={(e) => setActionFilter(e.target.value as ActionType | 'ALL')}
-                >
-                  <option value="ALL">ALL</option>
-                  {ACTION_ORDER.map((t) => (
-                    <option key={t} value={t}>
-                      {labelAction(t)}
+                  {AGING_BUCKETS.map((b) => (
+                    <option key={b.id} value={b.id}>
+                      {b.label}
                     </option>
                   ))}
                 </select>
@@ -312,6 +378,7 @@ export default function App() {
                   exportWorkbook(
                     filtered,
                     header,
+                    agingHeader,
                     clients,
                     `clearing-${threshold}-${agingDays}d.xlsx`,
                   )
@@ -360,28 +427,69 @@ export default function App() {
           </section>
 
           {view === 'header' && (
-            <section className="table-wrap">
-              <table>
-                <thead>
-                  <tr>
-                    <th>Action</th>
-                    <th className="num">Lines</th>
-                    <th className="num">Amount</th>
-                    <th className="num">Share of $</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {header.map((h) => {
-                    const share =
-                      stats.openAmount === 0
-                        ? 0
-                        : (Math.abs(h.amount) / Math.abs(stats.openAmount)) * 100;
-                    return (
+            <>
+              <section className="table-wrap">
+                <div className="section-label">Aging</div>
+                <table>
+                  <thead>
+                    <tr>
+                      <th>Aging</th>
+                      <th className="num">Lines</th>
+                      <th className="num">Amount</th>
+                      <th className="num">Share of $</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {agingHeader.map((a) => {
+                      const share =
+                        stats.openAmount === 0
+                          ? 0
+                          : (Math.abs(a.amount) / Math.abs(stats.openAmount)) * 100;
+                      return (
+                        <tr
+                          key={a.id}
+                          className="clickable"
+                          onClick={() => {
+                            setAgingFilter(a.id);
+                            setView('detail');
+                          }}
+                        >
+                          <td>
+                            <span className={`tag aging bucket-${a.id}`}>{a.label}</span>
+                          </td>
+                          <td className="num">{a.count.toLocaleString()}</td>
+                          <td className="num">{fmtMoney(a.amount)}</td>
+                          <td className="num">{share.toFixed(1)}%</td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+                {!agingHeader.length && <p className="hint">No rows for current filters.</p>}
+              </section>
+
+              <section className="table-wrap" style={{ marginTop: '0.85rem' }}>
+                <div className="section-label">By action × aging</div>
+                <table>
+                  <thead>
+                    <tr>
+                      <th>Action</th>
+                      <th className="num">Lines</th>
+                      <th className="num">Amount</th>
+                      {AGING_BUCKETS.map((b) => (
+                        <th key={b.id} className="num narrow">
+                          {b.label}
+                        </th>
+                      ))}
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {header.map((h) => (
                       <tr
                         key={h.type}
                         className="clickable"
                         onClick={() => {
-                          setActionFilter(h.type);
+                          setActionFilters([h.type]);
                           setView('detail');
                         }}
                       >
@@ -390,14 +498,21 @@ export default function App() {
                         </td>
                         <td className="num">{h.count.toLocaleString()}</td>
                         <td className="num">{fmtMoney(h.amount)}</td>
-                        <td className="num">{share.toFixed(1)}%</td>
+                        {AGING_BUCKETS.map((b) => {
+                          const cell = h.byAging[b.id];
+                          return (
+                            <td key={b.id} className="num narrow">
+                              {cell ? fmtMoney(cell.amount) : '—'}
+                            </td>
+                          );
+                        })}
                       </tr>
-                    );
-                  })}
-                </tbody>
-              </table>
-              {!header.length && <p className="hint">No rows for current filters.</p>}
-            </section>
+                    ))}
+                  </tbody>
+                </table>
+                {!header.length && <p className="hint">No rows for current filters.</p>}
+              </section>
+            </>
           )}
 
           {view === 'clients' && (
@@ -458,6 +573,7 @@ export default function App() {
                     <th>Division</th>
                     <th>Customer</th>
                     <th>Age</th>
+                    <th>Aging</th>
                     <th>Amount</th>
                     <th>RK2</th>
                     <th>Dispute</th>
@@ -479,6 +595,10 @@ export default function App() {
                         </div>
                       </td>
                       <td className="num">{p.daysInArrears ?? '—'}</td>
+                      <td className="mono">
+                        {AGING_BUCKETS.find((b) => b.id === agingBucketId(p.daysInArrears))
+                          ?.label ?? '—'}
+                      </td>
                       <td className="num">{fmtMoney(p.amount)}</td>
                       <td className="mono">{p.referenceKey2 || '—'}</td>
                       <td className="mono">{p.disputeStatus || '—'}</td>
