@@ -18,10 +18,6 @@ import type {
 } from './types';
 
 const NET_TOLERANCE = 0.05;
-/** Skip cross-assignment matching above this pool size (keeps UI responsive). */
-const MAX_CROSS_MATCH_POOL = 800;
-/** Never treat huge pools as a single net-zero clear group. */
-const MAX_NET_ZERO_GROUP = 80;
 
 function ageOf(row: LineItem): number {
   return row.daysInArrears ?? 0;
@@ -58,11 +54,13 @@ function accountDivisionKey(row: LineItem): string {
   return `${row.customer || row.customerName}|${row.division}|${row.businessArea}`;
 }
 
+/** Same account + division + reason code (mass net-zero scope). */
+function accountDivisionReasonKey(row: LineItem): string {
+  return `${accountDivisionKey(row)}|${row.reasonCode}`;
+}
+
 /**
- * Decision tree for lines not consumed by matching (first match wins):
- * 1. R16 → AUTO_CLEAR_R16
- * 2. Key2 contains WO → AUTO_CLEAR_WO
- * ...
+ * Decision tree for lines not consumed by matching (first match wins).
  */
 export function decideAction(row: LineItem, options: ProposalOptions): {
   type: ActionType;
@@ -211,7 +209,7 @@ function takeNextUnused(
   return undefined;
 }
 
-/** Exact opposite-amount pairs — O(n). Oldest debits first; oldest matching credit. */
+/** Exact opposite-amount pairs — O(n). Oldest debits first. */
 function takeExactPairs(pool: LineItem[]): LineItem[][] {
   if (pool.length < 2) return [];
   const groups: LineItem[][] = [];
@@ -235,23 +233,59 @@ function takeExactPairs(pool: LineItem[]): LineItem[][] {
   return groups;
 }
 
-/** If pool nets ~0 and has both signs, clear the whole pool (oldest-first). */
-function takeNetZeroGroup(pool: LineItem[]): LineItem[] | null {
-  if (pool.length < 2 || pool.length > MAX_NET_ZERO_GROUP) return null;
+/**
+ * Mass net-zero (not 1:1 line pairs):
+ * - If the whole pool nets ~0 → clear all
+ * - Else: oldest credits first; each credit consumes one or many claims until covered
+ */
+function takeMassNetZeroGroups(pool: LineItem[]): LineItem[][] {
+  if (pool.length < 2) return [];
+
   const hasPos = pool.some((r) => r.amount > 0);
   const hasNeg = pool.some((r) => r.amount < 0);
-  if (!hasPos || !hasNeg) return null;
-  const net = pool.reduce((s, r) => s + r.amount, 0);
-  if (Math.abs(net) > NET_TOLERANCE) return null;
-  return [...pool].sort(ageDesc);
+  if (!hasPos || !hasNeg) return [];
+
+  const netAll = pool.reduce((s, r) => s + r.amount, 0);
+  if (Math.abs(netAll) <= NET_TOLERANCE) {
+    return [[...pool].sort(ageDesc)];
+  }
+
+  const groups: LineItem[][] = [];
+  const used = new Set<string>();
+  const credits = pool.filter((r) => r.amount < 0).sort(ageDesc);
+
+  for (const credit of credits) {
+    if (used.has(credit.id)) continue;
+    let need = Math.abs(credit.amount);
+    const takenDebits: LineItem[] = [];
+
+    const debits = pool
+      .filter((r) => r.amount > 0 && !used.has(r.id))
+      .sort(ageDesc);
+
+    for (const debit of debits) {
+      // Whole lines only — skip claims that would overshoot beyond tolerance
+      if (debit.amount - need > NET_TOLERANCE) continue;
+      takenDebits.push(debit);
+      need -= debit.amount;
+      if (need <= NET_TOLERANCE) break;
+    }
+
+    if (need > NET_TOLERANCE || takenDebits.length === 0) continue;
+
+    used.add(credit.id);
+    for (const d of takenDebits) used.add(d.id);
+    groups.push([credit, ...takenDebits].sort(ageDesc));
+  }
+
+  return groups;
 }
 
 type MatchType = 'MATCH_ASSIGNMENT' | 'MATCH_NET_ZERO';
 
 /**
- * Matching within same account + division:
- * 1) MATCH_ASSIGNMENT — same assignment exact / net-zero (oldest first)
- * 2) MATCH_NET_ZERO — cross-assignment exact / net-zero (oldest first)
+ * 1) MATCH_ASSIGNMENT — same account + division + assignment
+ * 2) MATCH_NET_ZERO — same account + division + reason code: mass clear (aged credits ↔ many claims)
  */
 function buildMatchProposals(rows: LineItem[]): {
   proposals: Proposal[];
@@ -260,19 +294,16 @@ function buildMatchProposals(rows: LineItem[]): {
   const proposals: Proposal[] = [];
   const claimed = new Set<string>();
 
-  const byAccountDiv = new Map<string, LineItem[]>();
-  for (const row of rows) {
-    const key = accountDivisionKey(row);
-    const list = byAccountDiv.get(key) ?? [];
-    list.push(row);
-    byAccountDiv.set(key, list);
-  }
-
   function claimGroup(group: LineItem[], type: MatchType, note: string) {
     const ids = group.map((r) => r.id);
-    const journals = group.map((r) => r.journalEntry).filter(Boolean).join(', ');
+    const journals = [
+      ...new Set(group.map((r) => r.journalEntry).filter(Boolean)),
+    ]
+      .slice(0, 12)
+      .join(', ');
     const confidence: Proposal['confidence'] =
       type === 'MATCH_NET_ZERO' ? 'review' : 'high';
+    const net = group.reduce((s, r) => s + r.amount, 0);
     for (const row of group) {
       if (claimed.has(row.id)) continue;
       claimed.add(row.id);
@@ -281,72 +312,71 @@ function buildMatchProposals(rows: LineItem[]): {
           row,
           type,
           confidence,
-          `${note} · group ${ids.length} lines · JE ${journals || '—'}`,
+          `${note} · ${ids.length} lines · net ${net.toFixed(2)} · JE ${journals || '—'}`,
           ids,
         ),
       );
     }
   }
 
-  for (const [, accountRows] of byAccountDiv) {
-    const available = () => accountRows.filter((r) => !claimed.has(r.id));
+  // Phase 1 — MATCH_ASSIGNMENT
+  const byAssignment = new Map<string, LineItem[]>();
+  for (const row of rows) {
+    const asn = row.assignment.trim();
+    if (!asn) continue;
+    const key = `${accountDivisionKey(row)}|${asn}`;
+    const list = byAssignment.get(key) ?? [];
+    list.push(row);
+    byAssignment.set(key, list);
+  }
 
-    // Phase 1 — MATCH_ASSIGNMENT (same account + division + assignment)
-    const byAssignment = new Map<string, LineItem[]>();
-    for (const row of available()) {
-      const asn = row.assignment.trim() || '(blank)';
-      const list = byAssignment.get(asn) ?? [];
-      list.push(row);
-      byAssignment.set(asn, list);
-    }
+  for (const [key, asnRows] of byAssignment) {
+    const asn = key.slice(key.lastIndexOf('|') + 1);
+    const open = asnRows.filter((r) => !claimed.has(r.id));
+    if (open.length < 2) continue;
 
-    for (const [asn, asnRows] of byAssignment) {
-      if (asn === '(blank)') continue;
-      const open = asnRows.filter((r) => !claimed.has(r.id));
-      if (open.length < 2) continue;
-
-      for (const pair of takeExactPairs(open)) {
-        const ages = pair.map((r) => r.daysInArrears ?? 0);
-        claimGroup(
-          pair,
-          'MATCH_ASSIGNMENT',
-          `Same account + division + assignment ${asn} — exact match (oldest first, ages ${ages.join('/')}d)`,
-        );
-      }
-
-      const afterPairs = open.filter((r) => !claimed.has(r.id));
-      const netGroup = takeNetZeroGroup(afterPairs);
-      if (netGroup) {
-        claimGroup(
-          netGroup,
-          'MATCH_ASSIGNMENT',
-          `Same account + division + assignment ${asn} — nets to zero (oldest-first)`,
-        );
-      }
-    }
-
-    // Phase 2 — MATCH_NET_ZERO (same account + division, cross-assignment)
-    const leftovers = available();
-    if (leftovers.length < 2) continue;
-    if (leftovers.length > MAX_CROSS_MATCH_POOL) continue;
-
-    for (const pair of takeExactPairs(leftovers)) {
-      const asns = [...new Set(pair.map((r) => r.assignment || '(blank)'))].join(' / ');
+    for (const pair of takeExactPairs(open)) {
       const ages = pair.map((r) => r.daysInArrears ?? 0);
       claimGroup(
         pair,
-        'MATCH_NET_ZERO',
-        `Same account + division — cross-assignment exact match (${asns}, oldest first ${ages.join('/')}d)`,
+        'MATCH_ASSIGNMENT',
+        `Same account + division + assignment ${asn} — exact pair (oldest first, ages ${ages.join('/')}d)`,
       );
     }
 
-    const afterExact = leftovers.filter((r) => !claimed.has(r.id));
-    const netGroup = takeNetZeroGroup(afterExact);
-    if (netGroup) {
+    const afterPairs = open.filter((r) => !claimed.has(r.id));
+    for (const group of takeMassNetZeroGroups(afterPairs)) {
       claimGroup(
-        netGroup,
+        group,
+        'MATCH_ASSIGNMENT',
+        `Same account + division + assignment ${asn} — mass net-zero (aged credits first)`,
+      );
+    }
+  }
+
+  // Phase 2 — MATCH_NET_ZERO: mass clear by account + division + reason code
+  const byReasonBucket = new Map<string, LineItem[]>();
+  for (const row of rows) {
+    if (claimed.has(row.id)) continue;
+    const key = accountDivisionReasonKey(row);
+    const list = byReasonBucket.get(key) ?? [];
+    list.push(row);
+    byReasonBucket.set(key, list);
+  }
+
+  for (const [, bucket] of byReasonBucket) {
+    const open = bucket.filter((r) => !claimed.has(r.id));
+    if (open.length < 2) continue;
+    if (!open.some((r) => r.amount < 0) || !open.some((r) => r.amount > 0)) continue;
+
+    const sample = open[0]!;
+    for (const group of takeMassNetZeroGroups(open)) {
+      const nCredits = group.filter((r) => r.amount < 0).length;
+      const nClaims = group.filter((r) => r.amount > 0).length;
+      claimGroup(
+        group,
         'MATCH_NET_ZERO',
-        'Same account + division — cross-assignment group nets to zero (oldest-first)',
+        `Mass clear · acct ${sample.customer || sample.customerName} · ${sample.division} · ${sample.reasonCode} · ${nCredits} credit(s) ↔ ${nClaims} claim(s) (aged first)`,
       );
     }
   }
