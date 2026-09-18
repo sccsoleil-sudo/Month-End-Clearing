@@ -132,6 +132,11 @@ h1 {
   color: var(--ink);
 }
 
+.analyzing {
+  color: var(--accent);
+  font-weight: 600;
+}
+
 .linkish {
   border: none;
   background: none;

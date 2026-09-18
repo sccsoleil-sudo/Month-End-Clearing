@@ -1,4 +1,4 @@
-import { useMemo, useState } from 'react';
+import { startTransition, useEffect, useMemo, useState } from 'react';
 import * as XLSX from 'xlsx';
 import {
   ACTION_ORDER,
@@ -29,6 +29,8 @@ const REASON_TAB_LABELS: Record<(typeof REASON_OPTIONS)[number], string> = {
 type ViewMode = 'header' | 'clients' | 'detail';
 type ReasonTab = 'ALL' | (typeof REASON_OPTIONS)[number];
 
+/** Cap DOM rows in Detail so the page stays responsive. */
+const DETAIL_ROW_CAP = 2_000;
 
 function fmtMoney(n: number): string {
   return n.toLocaleString(undefined, { style: 'currency', currency: 'CAD' });
@@ -124,8 +126,10 @@ function exportWorkbook(
 
 export default function App() {
   const [items, setItems] = useState<LineItem[]>([]);
+  const [proposals, setProposals] = useState<Proposal[]>([]);
   const [fileName, setFileName] = useState('');
   const [busy, setBusy] = useState(false);
+  const [analyzing, setAnalyzing] = useState(false);
   const [error, setError] = useState('');
   const [threshold, setThreshold] = useState(DEFAULT_THRESHOLD);
   const [agingDays, setAgingDays] = useState(DEFAULT_AGING_DAYS);
@@ -140,12 +144,14 @@ export default function App() {
   async function loadFile(file: File) {
     setBusy(true);
     setError('');
+    setProposals([]);
     try {
       const buffer = await file.arrayBuffer();
       const parsed = parseWorkbook(buffer);
       if (!parsed.length) {
         setError('No R02 / R03 / R11 / R16 rows found. Check the file columns.');
         setItems([]);
+        setFileName('');
       } else {
         setItems(parsed);
         setFileName(file.name);
@@ -153,20 +159,38 @@ export default function App() {
     } catch (e) {
       setError(e instanceof Error ? e.message : 'Failed to read workbook');
       setItems([]);
+      setFileName('');
     } finally {
       setBusy(false);
     }
   }
 
-  const proposals = useMemo(
-    () =>
-      buildProposals(items, {
+  // Build proposals off the critical paint path so the UI stays responsive.
+  useEffect(() => {
+    if (!items.length) {
+      setProposals([]);
+      setAnalyzing(false);
+      return;
+    }
+    let cancelled = false;
+    setAnalyzing(true);
+    const timer = window.setTimeout(() => {
+      const next = buildProposals(items, {
         threshold,
         agingDays,
         reasonCodes: [...REASON_OPTIONS],
-      }),
-    [items, threshold, agingDays],
-  );
+      });
+      if (cancelled) return;
+      startTransition(() => {
+        setProposals(next);
+        setAnalyzing(false);
+      });
+    }, 0);
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timer);
+    };
+  }, [items, threshold, agingDays]);
 
   const activeReasons = useMemo(() => {
     if (reasonTab !== 'ALL') return [reasonTab];
@@ -184,6 +208,11 @@ export default function App() {
       return true;
     });
   }, [proposals, divisionFilter, activeReasons, actionFilters, agingFilters]);
+
+  const detailRows = useMemo(
+    () => filtered.slice(0, DETAIL_ROW_CAP),
+    [filtered],
+  );
 
   const header = useMemo(() => headerByAction(filtered), [filtered]);
   const agingHeader = useMemo(() => headerByAging(filtered), [filtered]);
@@ -260,7 +289,7 @@ export default function App() {
       <header className="hero">
         <p className="eyebrow">Logistics AR</p>
         <h1>Month-End Clearing</h1>
-        <p className="build-stamp">Build 2026-09-18h · PMT aged claims</p>
+        <p className="build-stamp">Build 2026-09-18j · assignment + net zero</p>
         <p className="lede">
           Decision tree by reason, RK2, threshold, and aging — header totals and by client.
         </p>
@@ -313,11 +342,13 @@ export default function App() {
             <div className="file-meta">
               <strong>{fileName}</strong>
               <span>{items.length.toLocaleString()} lines (R02 / R03 / R11 / R16)</span>
+              {analyzing && <span className="analyzing">Analyzing matches…</span>}
               <button
                 type="button"
                 className="linkish"
                 onClick={() => {
                   setItems([]);
+                  setProposals([]);
                   setFileName('');
                 }}
               >
@@ -661,7 +692,7 @@ export default function App() {
                   </tr>
                 </thead>
                 <tbody>
-                  {filtered.slice(0, 500).map((p) => (
+                  {detailRows.map((p) => (
                     <tr key={p.id}>
                       <td>
                         <span className={`tag ${p.type}`}>{labelAction(p.type)}</span>
@@ -687,12 +718,16 @@ export default function App() {
                   ))}
                 </tbody>
               </table>
-              {filtered.length > 500 && (
+              {filtered.length > DETAIL_ROW_CAP && (
                 <p className="hint">
-                  Showing first 500 of {filtered.length.toLocaleString()} — export for full list.
+                  Showing first {DETAIL_ROW_CAP.toLocaleString()} of{' '}
+                  {filtered.length.toLocaleString()} — export for full list.
                 </p>
               )}
-              {!filtered.length && <p className="hint">No proposals for the current filters.</p>}
+              {analyzing && <p className="hint">Building proposals…</p>}
+              {!analyzing && !filtered.length && (
+                <p className="hint">No proposals for the current filters.</p>
+              )}
             </section>
           )}
         </>

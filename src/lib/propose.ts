@@ -1,7 +1,6 @@
 import {
   ACTION_ORDER,
   AGING_BUCKETS,
-  PMT_CODE,
   REFUSE_PREFIX,
   WRITE_OFF_CONTAINS,
   WRITE_OFF_THRESHOLD_REASONS,
@@ -19,6 +18,10 @@ import type {
 } from './types';
 
 const NET_TOLERANCE = 0.05;
+/** Skip cross-assignment matching above this pool size (keeps UI responsive). */
+const MAX_CROSS_MATCH_POOL = 800;
+/** Never treat huge pools as a single net-zero clear group. */
+const MAX_NET_ZERO_GROUP = 80;
 
 function ageOf(row: LineItem): number {
   return row.daysInArrears ?? 0;
@@ -41,10 +44,6 @@ function isWo(rk2: string): boolean {
   return normalizeCode(rk2).includes(WRITE_OFF_CONTAINS);
 }
 
-function isPmt(rk2: string): boolean {
-  return normalizeCode(rk2) === PMT_CODE;
-}
-
 function isCom(rk2: string): boolean {
   const n = normalizeCode(rk2);
   return n.startsWith(REFUSE_PREFIX) && !n.includes(WRITE_OFF_CONTAINS);
@@ -54,15 +53,15 @@ function moneyKey(n: number): string {
   return n.toFixed(2);
 }
 
-function clientDivisionKey(row: LineItem): string {
+/** Same customer account + division (+ business area). */
+function accountDivisionKey(row: LineItem): string {
   return `${row.customer || row.customerName}|${row.division}|${row.businessArea}`;
 }
 
 /**
  * Decision tree for lines not consumed by matching (first match wins):
- * 1. Key2 = PMT (unpaired) → MATCH_OFFSET (flag for manual follow-up)
- * 2. R16 → AUTO_CLEAR_R16
- * 3. Key2 contains WO → AUTO_CLEAR_WO
+ * 1. R16 → AUTO_CLEAR_R16
+ * 2. Key2 contains WO → AUTO_CLEAR_WO
  * ...
  */
 export function decideAction(row: LineItem, options: ProposalOptions): {
@@ -75,15 +74,6 @@ export function decideAction(row: LineItem, options: ProposalOptions): {
   const rawDays = row.daysInArrears;
   const dispute = normalizeCode(row.disputeStatus) || '(none)';
   const absAmt = Math.abs(row.amount);
-
-  // Unpaired PMT — still surface as MATCH_OFFSET (aged ones sorted to top in list)
-  if (isPmt(rk2)) {
-    return {
-      type: 'MATCH_OFFSET',
-      confidence: 'review',
-      note: `RK2 = PMT — no exact opposite found in same client/division (age ${age}d); review manually`,
-    };
-  }
 
   if (row.reasonCode === 'R16') {
     return {
@@ -193,85 +183,61 @@ function ageDesc(a: LineItem, b: LineItem): number {
   return (b.daysInArrears ?? 0) - (a.daysInArrears ?? 0);
 }
 
-function isPmtRow(row: LineItem): boolean {
-  return isPmt(row.referenceKey2);
-}
-
-function claimAge(row: LineItem): number {
-  return row.daysInArrears ?? 0;
-}
-
-/** Prefer aged claims (>= agingDays), then oldest. */
-function preferAgedClaim(a: LineItem, b: LineItem, agingDays: number): number {
-  const aAged = claimAge(a) >= agingDays ? 0 : 1;
-  const bAged = claimAge(b) >= agingDays ? 0 : 1;
-  if (aAged !== bAged) return aAged - bAged;
-  return ageDesc(a, b);
-}
-
-/**
- * PMT ↔ claim exact pairs (same logic spirit as assignment/net-zero).
- * Oldest PMT first; partner = aged claim preferred, then oldest claim.
- */
-function takePmtExactPairs(pool: LineItem[], agingDays: number): LineItem[][] {
-  const groups: LineItem[][] = [];
-  const used = new Set<string>();
-  const pmts = pool.filter(isPmtRow).sort(ageDesc);
-
-  for (const pmt of pmts) {
-    if (used.has(pmt.id)) continue;
-    const needPos = pmt.amount < 0;
-    const partner = pool
-      .filter(
-        (r) =>
-          !used.has(r.id) &&
-          !isPmtRow(r) &&
-          (needPos ? r.amount > 0 : r.amount < 0) &&
-          moneyKey(r.amount) === moneyKey(-pmt.amount),
-      )
-      .sort((a, b) => preferAgedClaim(a, b, agingDays))[0];
-    if (!partner) continue;
-    used.add(pmt.id);
-    used.add(partner.id);
-    groups.push([pmt, partner].sort(ageDesc));
+/** Index rows by absolute money key for O(1) partner lookup (buckets sorted oldest-first). */
+function indexByAbsAmount(rows: LineItem[]): Map<string, LineItem[]> {
+  const map = new Map<string, LineItem[]>();
+  for (const row of rows) {
+    const k = moneyKey(Math.abs(row.amount));
+    const list = map.get(k) ?? [];
+    list.push(row);
+    map.set(k, list);
   }
-  return groups;
+  for (const list of map.values()) list.sort(ageDesc);
+  return map;
 }
 
-/** Net-zero group only if it includes at least one PMT. */
-function takePmtNetZeroGroup(pool: LineItem[]): LineItem[] | null {
-  if (!pool.some(isPmtRow)) return null;
-  return takeNetZeroGroup(pool);
+function takeNextUnused(
+  list: LineItem[] | undefined,
+  used: Set<string>,
+  pred: (r: LineItem) => boolean,
+): LineItem | undefined {
+  if (!list) return undefined;
+  for (let i = 0; i < list.length; i++) {
+    const row = list[i]!;
+    if (used.has(row.id) || !pred(row)) continue;
+    list.splice(i, 1);
+    return row;
+  }
+  return undefined;
 }
 
-/** Exact opposite-amount pairs; oldest (highest days in arrears) first. */
+/** Exact opposite-amount pairs — O(n). Oldest debits first; oldest matching credit. */
 function takeExactPairs(pool: LineItem[]): LineItem[][] {
+  if (pool.length < 2) return [];
   const groups: LineItem[][] = [];
-  const remaining = [...pool];
   const used = new Set<string>();
+  const credits = pool.filter((r) => r.amount < 0);
+  const byAmt = indexByAbsAmount(credits);
 
-  const pos = remaining.filter((r) => r.amount > 0).sort(ageDesc);
-  for (const debit of pos) {
+  const debits = pool.filter((r) => r.amount > 0).sort(ageDesc);
+  for (const debit of debits) {
     if (used.has(debit.id)) continue;
-    const credit = remaining
-      .filter(
-        (c) =>
-          !used.has(c.id) &&
-          c.amount < 0 &&
-          moneyKey(c.amount) === moneyKey(-debit.amount),
-      )
-      .sort(ageDesc)[0];
+    const credit = takeNextUnused(
+      byAmt.get(moneyKey(debit.amount)),
+      used,
+      (r) => r.amount < 0,
+    );
     if (!credit) continue;
     used.add(debit.id);
     used.add(credit.id);
-    groups.push([debit, credit]);
+    groups.push([debit, credit].sort(ageDesc));
   }
   return groups;
 }
 
 /** If pool nets ~0 and has both signs, clear the whole pool (oldest-first). */
 function takeNetZeroGroup(pool: LineItem[]): LineItem[] | null {
-  if (pool.length < 2) return null;
+  if (pool.length < 2 || pool.length > MAX_NET_ZERO_GROUP) return null;
   const hasPos = pool.some((r) => r.amount > 0);
   const hasNeg = pool.some((r) => r.amount < 0);
   if (!hasPos || !hasNeg) return null;
@@ -280,53 +246,26 @@ function takeNetZeroGroup(pool: LineItem[]): LineItem[] | null {
   return [...pool].sort(ageDesc);
 }
 
-/** Greedy exact pairs: oldest debits first, then oldest matching credit. */
-function takeGreedyPairs(pool: LineItem[]): LineItem[][] {
-  const groups: LineItem[][] = [];
-  const open = [...pool];
-  const used = new Set<string>();
-
-  const sortedDebits = open.filter((r) => r.amount > 0).sort(ageDesc);
-
-  for (const debit of sortedDebits) {
-    if (used.has(debit.id)) continue;
-    const credit = open
-      .filter(
-        (c) =>
-          !used.has(c.id) &&
-          c.amount < 0 &&
-          moneyKey(c.amount) === moneyKey(-debit.amount),
-      )
-      .sort(ageDesc)[0];
-    if (!credit) continue;
-    used.add(debit.id);
-    used.add(credit.id);
-    groups.push([debit, credit]);
-  }
-  return groups;
-}
-
-type MatchType = 'MATCH_OFFSET' | 'MATCH_ASSIGNMENT' | 'MATCH_NET_ZERO';
+type MatchType = 'MATCH_ASSIGNMENT' | 'MATCH_NET_ZERO';
 
 /**
- * Matching within same client + division:
- * 0) MATCH_OFFSET — PMT ↔ claims (assignment then net-zero; aged claims preferred)
- * 1) MATCH_ASSIGNMENT — same assignment exact / net-zero
- * 2) MATCH_NET_ZERO — cross-assignment exact / net-zero
+ * Matching within same account + division:
+ * 1) MATCH_ASSIGNMENT — same assignment exact / net-zero (oldest first)
+ * 2) MATCH_NET_ZERO — cross-assignment exact / net-zero (oldest first)
  */
-function buildMatchProposals(
-  rows: LineItem[],
-  agingDays: number,
-): { proposals: Proposal[]; claimed: Set<string> } {
+function buildMatchProposals(rows: LineItem[]): {
+  proposals: Proposal[];
+  claimed: Set<string>;
+} {
   const proposals: Proposal[] = [];
   const claimed = new Set<string>();
 
-  const byClientDiv = new Map<string, LineItem[]>();
+  const byAccountDiv = new Map<string, LineItem[]>();
   for (const row of rows) {
-    const key = clientDivisionKey(row);
-    const list = byClientDiv.get(key) ?? [];
+    const key = accountDivisionKey(row);
+    const list = byAccountDiv.get(key) ?? [];
     list.push(row);
-    byClientDiv.set(key, list);
+    byAccountDiv.set(key, list);
   }
 
   function claimGroup(group: LineItem[], type: MatchType, note: string) {
@@ -349,51 +288,10 @@ function buildMatchProposals(
     }
   }
 
-  /** Same structure as assignment / net-zero, but PMT ↔ aged claims. */
-  function runPmtOffsetMatching(pool: LineItem[], scopeNote: string) {
-    const open = pool.filter((r) => !claimed.has(r.id));
-    if (open.length < 2 || !open.some(isPmtRow)) return;
+  for (const [, accountRows] of byAccountDiv) {
+    const available = () => accountRows.filter((r) => !claimed.has(r.id));
 
-    for (const pair of takePmtExactPairs(open, agingDays)) {
-      const pmt = pair.find(isPmtRow)!;
-      const claim = pair.find((r) => !isPmtRow(r))!;
-      const ages = pair.map((r) => r.daysInArrears ?? 0);
-      const claimAged = claimAge(claim) >= agingDays ? 'aged claim' : 'claim';
-      claimGroup(
-        pair,
-        'MATCH_OFFSET',
-        `PMT offset ↔ ${claimAged} · ${scopeNote} · exact (PMT age ${pmt.daysInArrears ?? 0}d / claim ${claim.daysInArrears ?? 0}d, ages ${ages.join('/')})`,
-      );
-    }
-
-    const afterExact = open.filter((r) => !claimed.has(r.id));
-    const netGroup = takePmtNetZeroGroup(afterExact);
-    if (netGroup) {
-      claimGroup(
-        netGroup,
-        'MATCH_OFFSET',
-        `PMT offset group nets to zero · ${scopeNote} · aged claims preferred`,
-      );
-    } else {
-      for (const pair of takePmtExactPairs(
-        afterExact.filter((r) => !claimed.has(r.id)),
-        agingDays,
-      )) {
-        const claim = pair.find((r) => !isPmtRow(r))!;
-        const claimAged = claimAge(claim) >= agingDays ? 'aged claim' : 'claim';
-        claimGroup(
-          pair,
-          'MATCH_OFFSET',
-          `PMT offset ↔ ${claimAged} · ${scopeNote} · exact`,
-        );
-      }
-    }
-  }
-
-  for (const [, clientRows] of byClientDiv) {
-    const available = () => clientRows.filter((r) => !claimed.has(r.id));
-
-    // Phase 0a — MATCH_OFFSET by assignment (same as MATCH_ASSIGNMENT structure)
+    // Phase 1 — MATCH_ASSIGNMENT (same account + division + assignment)
     const byAssignment = new Map<string, LineItem[]>();
     for (const row of available()) {
       const asn = row.assignment.trim() || '(blank)';
@@ -404,24 +302,6 @@ function buildMatchProposals(
 
     for (const [asn, asnRows] of byAssignment) {
       if (asn === '(blank)') continue;
-      if (!asnRows.some(isPmtRow)) continue;
-      runPmtOffsetMatching(asnRows, `same assignment ${asn}`);
-    }
-
-    // Phase 0b — MATCH_OFFSET cross-assignment (same as MATCH_NET_ZERO structure)
-    runPmtOffsetMatching(available(), 'cross-assignment (net toward zero)');
-
-    // Phase 1 — MATCH_ASSIGNMENT
-    const byAssignment2 = new Map<string, LineItem[]>();
-    for (const row of available()) {
-      const asn = row.assignment.trim() || '(blank)';
-      const list = byAssignment2.get(asn) ?? [];
-      list.push(row);
-      byAssignment2.set(asn, list);
-    }
-
-    for (const [asn, asnRows] of byAssignment2) {
-      if (asn === '(blank)') continue;
       const open = asnRows.filter((r) => !claimed.has(r.id));
       if (open.length < 2) continue;
 
@@ -430,7 +310,7 @@ function buildMatchProposals(
         claimGroup(
           pair,
           'MATCH_ASSIGNMENT',
-          `Same client + division + assignment ${asn} — exact match (oldest first, ages ${ages.join('/')}d)`,
+          `Same account + division + assignment ${asn} — exact match (oldest first, ages ${ages.join('/')}d)`,
         );
       }
 
@@ -440,23 +320,15 @@ function buildMatchProposals(
         claimGroup(
           netGroup,
           'MATCH_ASSIGNMENT',
-          `Same client + division + assignment ${asn} — nets to zero (oldest-first)`,
+          `Same account + division + assignment ${asn} — nets to zero (oldest-first)`,
         );
-      } else {
-        for (const pair of takeGreedyPairs(afterPairs.filter((r) => !claimed.has(r.id)))) {
-          const ages = pair.map((r) => r.daysInArrears ?? 0);
-          claimGroup(
-            pair,
-            'MATCH_ASSIGNMENT',
-            `Same client + division + assignment ${asn} — exact match (oldest first, ages ${ages.join('/')}d)`,
-          );
-        }
       }
     }
 
-    // Phase 2 — MATCH_NET_ZERO
+    // Phase 2 — MATCH_NET_ZERO (same account + division, cross-assignment)
     const leftovers = available();
     if (leftovers.length < 2) continue;
+    if (leftovers.length > MAX_CROSS_MATCH_POOL) continue;
 
     for (const pair of takeExactPairs(leftovers)) {
       const asns = [...new Set(pair.map((r) => r.assignment || '(blank)'))].join(' / ');
@@ -464,7 +336,7 @@ function buildMatchProposals(
       claimGroup(
         pair,
         'MATCH_NET_ZERO',
-        `Same client + division — cross-assignment exact match (${asns}, oldest first ${ages.join('/')}d)`,
+        `Same account + division — cross-assignment exact match (${asns}, oldest first ${ages.join('/')}d)`,
       );
     }
 
@@ -474,18 +346,8 @@ function buildMatchProposals(
       claimGroup(
         netGroup,
         'MATCH_NET_ZERO',
-        'Same client + division — cross-assignment group nets to zero (oldest-first)',
+        'Same account + division — cross-assignment group nets to zero (oldest-first)',
       );
-    } else {
-      for (const pair of takeGreedyPairs(afterExact.filter((r) => !claimed.has(r.id)))) {
-        const asns = [...new Set(pair.map((r) => r.assignment || '(blank)'))].join(' / ');
-        const ages = pair.map((r) => r.daysInArrears ?? 0);
-        claimGroup(
-          pair,
-          'MATCH_NET_ZERO',
-          `Same client + division — cross-assignment exact match (${asns}, oldest first ${ages.join('/')}d)`,
-        );
-      }
     }
   }
 
@@ -494,7 +356,7 @@ function buildMatchProposals(
 
 export function buildProposals(items: LineItem[], options: ProposalOptions): Proposal[] {
   const scoped = items.filter((r) => options.reasonCodes.includes(r.reasonCode));
-  const { proposals: matched, claimed } = buildMatchProposals(scoped, options.agingDays);
+  const { proposals: matched, claimed } = buildMatchProposals(scoped);
 
   const rest = scoped
     .filter((row) => !claimed.has(row.id))
@@ -583,8 +445,7 @@ export function summarize(items: LineItem[], proposals: Proposal[]) {
         p.type === 'AUTO_CLEAR_WO' ||
         p.type === 'PROPOSE_WRITE_OFF' ||
         p.type === 'AUTO_CLEAR_LOW_VALUE' ||
-        p.type === 'PROPOSE_CLEAR_AGED' ||
-        p.type === 'MATCH_OFFSET',
+        p.type === 'PROPOSE_CLEAR_AGED',
     ).length,
   };
 }
