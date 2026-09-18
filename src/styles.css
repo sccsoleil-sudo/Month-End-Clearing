@@ -348,8 +348,7 @@ th {
 }
 
 .tag.MATCH_ASSIGNMENT,
-.tag.MATCH_NET_ZERO,
-.tag.MATCH_OFFSET {
+.tag.MATCH_NET_ZERO {
   background: #e2e8f2;
   color: #243552;
 }

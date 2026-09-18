@@ -21,7 +21,7 @@ export function divisionFor(businessArea: string): string {
 
 export function classifyShortageRk2(refKey2: string): string {
   const rk2 = normalizeCode(refKey2);
-  if (rk2 === PMT_CODE) return 'PMT / Offset';
+  if (rk2 === PMT_CODE) return 'PMT';
   if (EXCLUDED_RK2.has(rk2)) return 'Excluded';
   if (RECOVERED_RK2.has(rk2)) return rk2 ? 'Recovered' : 'Pending';
   if (rk2.includes(WRITE_OFF_CONTAINS)) {
@@ -47,7 +47,7 @@ function isBrandOnlyText(itemText: string): boolean {
 
 export function classifyPenalty(refKey2: string, itemText: string, assignment: string): string {
   const rk2 = normalizeCode(refKey2);
-  if (rk2 === PMT_CODE) return 'PMT / Offset';
+  if (rk2 === PMT_CODE) return 'PMT';
   if (EXCLUDED_RK2.has(rk2)) return 'Excluded';
   if (PENALTY_RK2[rk2]) return PENALTY_RK2[rk2];
   if (rk2.includes(WRITE_OFF_CONTAINS)) {
