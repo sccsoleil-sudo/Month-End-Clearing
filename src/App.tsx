@@ -6,16 +6,15 @@ import {
   DEFAULT_AGING_DAYS,
   DEFAULT_THRESHOLD,
 } from './config/rules';
-import { parseWorkbook } from './lib/parseWorkbook';
 import {
   agingBucketId,
-  buildProposals,
   headerByAction,
   headerByAging,
   summarize,
   summarizeByClient,
 } from './lib/propose';
 import type { ActionType, LineItem, Proposal } from './lib/types';
+import { useAnalyzeWorker } from './workers/analyzeClient';
 
 const REASON_OPTIONS = ['R02', 'R03', 'R11', 'R16'] as const;
 
@@ -31,6 +30,14 @@ type ReasonTab = 'ALL' | (typeof REASON_OPTIONS)[number];
 
 /** Cap DOM rows in Detail so the page stays responsive. */
 const DETAIL_ROW_CAP = 2_000;
+
+function proposalOptions(threshold: number, agingDays: number) {
+  return {
+    threshold,
+    agingDays,
+    reasonCodes: [...REASON_OPTIONS] as string[],
+  };
+}
 
 function fmtMoney(n: number): string {
   return n.toLocaleString(undefined, { style: 'currency', currency: 'CAD' });
@@ -125,10 +132,12 @@ function exportWorkbook(
 }
 
 export default function App() {
+  const worker = useAnalyzeWorker();
   const [items, setItems] = useState<LineItem[]>([]);
   const [proposals, setProposals] = useState<Proposal[]>([]);
   const [fileName, setFileName] = useState('');
   const [busy, setBusy] = useState(false);
+  const [busyLabel, setBusyLabel] = useState('Reading workbook…');
   const [analyzing, setAnalyzing] = useState(false);
   const [error, setError] = useState('');
   const [threshold, setThreshold] = useState(DEFAULT_THRESHOLD);
@@ -143,54 +152,64 @@ export default function App() {
 
   async function loadFile(file: File) {
     setBusy(true);
+    setBusyLabel('Reading workbook in background…');
     setError('');
     setProposals([]);
+    setItems([]);
     try {
       const buffer = await file.arrayBuffer();
-      const parsed = parseWorkbook(buffer);
-      if (!parsed.length) {
+      setBusyLabel('Parsing & matching (UI stays responsive)…');
+      const result = await worker.analyze(buffer, proposalOptions(threshold, agingDays));
+      if (!('items' in result) || !result.items.length) {
         setError('No R02 / R03 / R11 / R16 rows found. Check the file columns.');
         setItems([]);
+        setProposals([]);
         setFileName('');
-      } else {
-        setItems(parsed);
-        setFileName(file.name);
+        return;
       }
+      startTransition(() => {
+        setItems(result.items);
+        setProposals(result.proposals);
+        setFileName(file.name);
+      });
     } catch (e) {
       setError(e instanceof Error ? e.message : 'Failed to read workbook');
       setItems([]);
+      setProposals([]);
       setFileName('');
     } finally {
       setBusy(false);
     }
   }
 
-  // Build proposals off the critical paint path so the UI stays responsive.
+  // Re-run matching in the worker when threshold / aging change (items already loaded).
   useEffect(() => {
     if (!items.length) {
-      setProposals([]);
       setAnalyzing(false);
       return;
     }
     let cancelled = false;
     setAnalyzing(true);
-    const timer = window.setTimeout(() => {
-      const next = buildProposals(items, {
-        threshold,
-        agingDays,
-        reasonCodes: [...REASON_OPTIONS],
-      });
-      if (cancelled) return;
-      startTransition(() => {
-        setProposals(next);
+    void worker
+      .propose(items, proposalOptions(threshold, agingDays))
+      .then((result) => {
+        if (cancelled) return;
+        startTransition(() => {
+          setProposals(result.proposals);
+          setAnalyzing(false);
+        });
+      })
+      .catch((e) => {
+        if (cancelled) return;
+        setError(e instanceof Error ? e.message : 'Failed to rebuild proposals');
         setAnalyzing(false);
       });
-    }, 0);
     return () => {
       cancelled = true;
-      window.clearTimeout(timer);
     };
-  }, [items, threshold, agingDays]);
+    // Intentionally omit `items`: loadFile already returns proposals from the worker.
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- only rebuild on rule changes
+  }, [threshold, agingDays, worker]);
 
   const activeReasons = useMemo(() => {
     if (reasonTab !== 'ALL') return [reasonTab];
@@ -289,7 +308,7 @@ export default function App() {
       <header className="hero">
         <p className="eyebrow">Logistics AR</p>
         <h1>Month-End Clearing</h1>
-        <p className="build-stamp">Build 2026-09-18j · assignment + net zero</p>
+        <p className="build-stamp">Build 2026-09-18k · background worker</p>
         <p className="lede">
           Decision tree by reason, RK2, threshold, and aging — header totals and by client.
         </p>
@@ -311,7 +330,7 @@ export default function App() {
           }}
         >
           {busy ? (
-            <p>Reading workbook…</p>
+            <p>{busyLabel}</p>
           ) : (
             <>
               <h2>Drop Customer Line Items</h2>

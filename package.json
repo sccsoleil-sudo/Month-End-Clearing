@@ -6,6 +6,7 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc --noEmit && vite build",
+    "build:pages": "tsc --noEmit && VITE_BASE=/Month-End-Clearing/ vite build && rm -rf docs/assets && cp dist/index.html docs/index.html && cp -R dist/assets docs/assets",
     "preview": "vite preview"
   },
   "dependencies": {
