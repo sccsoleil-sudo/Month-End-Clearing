@@ -59,6 +59,13 @@ h1 {
   color: var(--muted);
 }
 
+.build-stamp {
+  margin: 0.35rem 0 0;
+  font-size: 0.8rem;
+  color: var(--accent);
+  font-weight: 600;
+}
+
 .dropzone {
   border: 1.5px dashed var(--line);
   background: var(--card);
