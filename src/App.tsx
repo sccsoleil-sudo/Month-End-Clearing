@@ -260,7 +260,7 @@ export default function App() {
       <header className="hero">
         <p className="eyebrow">Logistics AR</p>
         <h1>Month-End Clearing</h1>
-        <p className="build-stamp">Build 2026-09-18g · PMT match</p>
+        <p className="build-stamp">Build 2026-09-18h · PMT aged claims</p>
         <p className="lede">
           Decision tree by reason, RK2, threshold, and aging — header totals and by client.
         </p>

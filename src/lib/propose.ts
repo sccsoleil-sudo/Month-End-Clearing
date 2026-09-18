@@ -197,42 +197,51 @@ function isPmtRow(row: LineItem): boolean {
   return isPmt(row.referenceKey2);
 }
 
+function claimAge(row: LineItem): number {
+  return row.daysInArrears ?? 0;
+}
+
+/** Prefer aged claims (>= agingDays), then oldest. */
+function preferAgedClaim(a: LineItem, b: LineItem, agingDays: number): number {
+  const aAged = claimAge(a) >= agingDays ? 0 : 1;
+  const bAged = claimAge(b) >= agingDays ? 0 : 1;
+  if (aAged !== bAged) return aAged - bAged;
+  return ageDesc(a, b);
+}
+
 /**
- * Pair PMT (payment/offset) lines to opposite-sign deductions.
- * Oldest PMT first; prefer same assignment, then any in client+division.
+ * PMT ↔ claim exact pairs (same logic spirit as assignment/net-zero).
+ * Oldest PMT first; partner = aged claim preferred, then oldest claim.
  */
-function takePmtPairs(pool: LineItem[]): LineItem[][] {
+function takePmtExactPairs(pool: LineItem[], agingDays: number): LineItem[][] {
   const groups: LineItem[][] = [];
   const used = new Set<string>();
   const pmts = pool.filter(isPmtRow).sort(ageDesc);
 
   for (const pmt of pmts) {
     if (used.has(pmt.id)) continue;
-    const needPos = pmt.amount < 0; // credit PMT seeks debit; debit PMT seeks credit
-    const candidates = pool
+    const needPos = pmt.amount < 0;
+    const partner = pool
       .filter(
         (r) =>
           !used.has(r.id) &&
-          r.id !== pmt.id &&
           !isPmtRow(r) &&
           (needPos ? r.amount > 0 : r.amount < 0) &&
           moneyKey(r.amount) === moneyKey(-pmt.amount),
       )
-      .sort((a, b) => {
-        // Prefer same assignment, then oldest
-        const aSame = (a.assignment || '') === (pmt.assignment || '') && !!pmt.assignment ? 0 : 1;
-        const bSame = (b.assignment || '') === (pmt.assignment || '') && !!pmt.assignment ? 0 : 1;
-        if (aSame !== bSame) return aSame - bSame;
-        return ageDesc(a, b);
-      });
-
-    const partner = candidates[0];
+      .sort((a, b) => preferAgedClaim(a, b, agingDays))[0];
     if (!partner) continue;
     used.add(pmt.id);
     used.add(partner.id);
     groups.push([pmt, partner].sort(ageDesc));
   }
   return groups;
+}
+
+/** Net-zero group only if it includes at least one PMT. */
+function takePmtNetZeroGroup(pool: LineItem[]): LineItem[] | null {
+  if (!pool.some(isPmtRow)) return null;
+  return takeNetZeroGroup(pool);
 }
 
 /** Exact opposite-amount pairs; oldest (highest days in arrears) first. */
@@ -301,11 +310,14 @@ type MatchType = 'MATCH_OFFSET' | 'MATCH_ASSIGNMENT' | 'MATCH_NET_ZERO';
 
 /**
  * Matching within same client + division:
- * 0) PMT payment/offset ↔ opposite deduction (oldest PMT first)
- * 1) Same assignment → exact / net-zero
- * 2) Cross-assignment → exact / net-zero
+ * 0) MATCH_OFFSET — PMT ↔ claims (assignment then net-zero; aged claims preferred)
+ * 1) MATCH_ASSIGNMENT — same assignment exact / net-zero
+ * 2) MATCH_NET_ZERO — cross-assignment exact / net-zero
  */
-function buildMatchProposals(rows: LineItem[]): { proposals: Proposal[]; claimed: Set<string> } {
+function buildMatchProposals(
+  rows: LineItem[],
+  agingDays: number,
+): { proposals: Proposal[]; claimed: Set<string> } {
   const proposals: Proposal[] = [];
   const claimed = new Set<string>();
 
@@ -337,27 +349,51 @@ function buildMatchProposals(rows: LineItem[]): { proposals: Proposal[]; claimed
     }
   }
 
-  for (const [, clientRows] of byClientDiv) {
-    const available = () => clientRows.filter((r) => !claimed.has(r.id));
+  /** Same structure as assignment / net-zero, but PMT ↔ aged claims. */
+  function runPmtOffsetMatching(pool: LineItem[], scopeNote: string) {
+    const open = pool.filter((r) => !claimed.has(r.id));
+    if (open.length < 2 || !open.some(isPmtRow)) return;
 
-    // Phase 0 — aged PMT payments / offsets first
-    const pmtPairs = takePmtPairs(available());
-    for (const pair of pmtPairs) {
+    for (const pair of takePmtExactPairs(open, agingDays)) {
       const pmt = pair.find(isPmtRow)!;
-      const other = pair.find((r) => r.id !== pmt.id)!;
+      const claim = pair.find((r) => !isPmtRow(r))!;
       const ages = pair.map((r) => r.daysInArrears ?? 0);
-      const sameAsn =
-        !!pmt.assignment && pmt.assignment === other.assignment
-          ? `assignment ${pmt.assignment}`
-          : 'cross-assignment';
+      const claimAged = claimAge(claim) >= agingDays ? 'aged claim' : 'claim';
       claimGroup(
         pair,
         'MATCH_OFFSET',
-        `PMT offset matched to deduction (${sameAsn}, oldest PMT first, ages ${ages.join('/')}d)`,
+        `PMT offset ↔ ${claimAged} · ${scopeNote} · exact (PMT age ${pmt.daysInArrears ?? 0}d / claim ${claim.daysInArrears ?? 0}d, ages ${ages.join('/')})`,
       );
     }
 
-    // Phase 1 — same assignment
+    const afterExact = open.filter((r) => !claimed.has(r.id));
+    const netGroup = takePmtNetZeroGroup(afterExact);
+    if (netGroup) {
+      claimGroup(
+        netGroup,
+        'MATCH_OFFSET',
+        `PMT offset group nets to zero · ${scopeNote} · aged claims preferred`,
+      );
+    } else {
+      for (const pair of takePmtExactPairs(
+        afterExact.filter((r) => !claimed.has(r.id)),
+        agingDays,
+      )) {
+        const claim = pair.find((r) => !isPmtRow(r))!;
+        const claimAged = claimAge(claim) >= agingDays ? 'aged claim' : 'claim';
+        claimGroup(
+          pair,
+          'MATCH_OFFSET',
+          `PMT offset ↔ ${claimAged} · ${scopeNote} · exact`,
+        );
+      }
+    }
+  }
+
+  for (const [, clientRows] of byClientDiv) {
+    const available = () => clientRows.filter((r) => !claimed.has(r.id));
+
+    // Phase 0a — MATCH_OFFSET by assignment (same as MATCH_ASSIGNMENT structure)
     const byAssignment = new Map<string, LineItem[]>();
     for (const row of available()) {
       const asn = row.assignment.trim() || '(blank)';
@@ -367,6 +403,24 @@ function buildMatchProposals(rows: LineItem[]): { proposals: Proposal[]; claimed
     }
 
     for (const [asn, asnRows] of byAssignment) {
+      if (asn === '(blank)') continue;
+      if (!asnRows.some(isPmtRow)) continue;
+      runPmtOffsetMatching(asnRows, `same assignment ${asn}`);
+    }
+
+    // Phase 0b — MATCH_OFFSET cross-assignment (same as MATCH_NET_ZERO structure)
+    runPmtOffsetMatching(available(), 'cross-assignment (net toward zero)');
+
+    // Phase 1 — MATCH_ASSIGNMENT
+    const byAssignment2 = new Map<string, LineItem[]>();
+    for (const row of available()) {
+      const asn = row.assignment.trim() || '(blank)';
+      const list = byAssignment2.get(asn) ?? [];
+      list.push(row);
+      byAssignment2.set(asn, list);
+    }
+
+    for (const [asn, asnRows] of byAssignment2) {
       if (asn === '(blank)') continue;
       const open = asnRows.filter((r) => !claimed.has(r.id));
       if (open.length < 2) continue;
@@ -400,7 +454,7 @@ function buildMatchProposals(rows: LineItem[]): { proposals: Proposal[]; claimed
       }
     }
 
-    // Phase 2 — cross-assignment net to zero
+    // Phase 2 — MATCH_NET_ZERO
     const leftovers = available();
     if (leftovers.length < 2) continue;
 
@@ -440,7 +494,7 @@ function buildMatchProposals(rows: LineItem[]): { proposals: Proposal[]; claimed
 
 export function buildProposals(items: LineItem[], options: ProposalOptions): Proposal[] {
   const scoped = items.filter((r) => options.reasonCodes.includes(r.reasonCode));
-  const { proposals: matched, claimed } = buildMatchProposals(scoped);
+  const { proposals: matched, claimed } = buildMatchProposals(scoped, options.agingDays);
 
   const rest = scoped
     .filter((row) => !claimed.has(row.id))
@@ -449,7 +503,6 @@ export function buildProposals(items: LineItem[], options: ProposalOptions): Pro
       return toProposal(row, decision.type, decision.confidence, decision.note, [row.id]);
     });
 
-  // Oldest first within matches, then remaining actions
   const byOldest = (a: Proposal, b: Proposal) =>
     (b.daysInArrears ?? 0) - (a.daysInArrears ?? 0);
 
