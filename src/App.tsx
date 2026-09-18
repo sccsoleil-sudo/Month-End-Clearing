@@ -19,7 +19,16 @@ import type { ActionType, LineItem, Proposal } from './lib/types';
 
 const REASON_OPTIONS = ['R02', 'R03', 'R11', 'R16'] as const;
 
+const REASON_TAB_LABELS: Record<(typeof REASON_OPTIONS)[number], string> = {
+  R02: 'R02 Shortage',
+  R03: 'R03 Price diff',
+  R11: 'R11',
+  R16: 'R16 Penalties',
+};
+
 type ViewMode = 'header' | 'clients' | 'detail';
+type ReasonTab = 'ALL' | (typeof REASON_OPTIONS)[number];
+
 
 function fmtMoney(n: number): string {
   return n.toLocaleString(undefined, { style: 'currency', currency: 'CAD' });
@@ -121,9 +130,10 @@ export default function App() {
   const [threshold, setThreshold] = useState(DEFAULT_THRESHOLD);
   const [agingDays, setAgingDays] = useState(DEFAULT_AGING_DAYS);
   const [reasons, setReasons] = useState<string[]>([...REASON_OPTIONS]);
+  const [reasonTab, setReasonTab] = useState<ReasonTab>('ALL');
   const [divisionFilter, setDivisionFilter] = useState('ALL');
   const [actionFilters, setActionFilters] = useState<ActionType[]>([...ACTION_ORDER]);
-  const [agingFilter, setAgingFilter] = useState<string>('ALL');
+  const [agingFilters, setAgingFilters] = useState<string[]>(AGING_BUCKETS.map((b) => b.id));
   const [view, setView] = useState<ViewMode>('header');
   const [over, setOver] = useState(false);
 
@@ -153,20 +163,27 @@ export default function App() {
       buildProposals(items, {
         threshold,
         agingDays,
-        reasonCodes: reasons,
+        reasonCodes: [...REASON_OPTIONS],
       }),
-    [items, threshold, agingDays, reasons],
+    [items, threshold, agingDays],
   );
+
+  const activeReasons = useMemo(() => {
+    if (reasonTab !== 'ALL') return [reasonTab];
+    return reasons;
+  }, [reasonTab, reasons]);
 
   const filtered = useMemo(() => {
     return proposals.filter((p) => {
       if (divisionFilter !== 'ALL' && p.division !== divisionFilter) return false;
-      if (!reasons.includes(p.reasonCode)) return false;
+      if (!activeReasons.includes(p.reasonCode)) return false;
       if (actionFilters.length > 0 && !actionFilters.includes(p.type)) return false;
-      if (agingFilter !== 'ALL' && agingBucketId(p.daysInArrears) !== agingFilter) return false;
+      if (agingFilters.length > 0 && !agingFilters.includes(agingBucketId(p.daysInArrears))) {
+        return false;
+      }
       return true;
     });
-  }, [proposals, divisionFilter, reasons, actionFilters, agingFilter]);
+  }, [proposals, divisionFilter, activeReasons, actionFilters, agingFilters]);
 
   const header = useMemo(() => headerByAction(filtered), [filtered]);
   const agingHeader = useMemo(() => headerByAging(filtered), [filtered]);
@@ -174,16 +191,27 @@ export default function App() {
   const stats = useMemo(
     () =>
       summarize(
-        items.filter((i) => reasons.includes(i.reasonCode)),
+        items.filter((i) => activeReasons.includes(i.reasonCode)),
         filtered,
       ),
-    [items, reasons, filtered],
+    [items, activeReasons, filtered],
   );
 
-  const divisions = useMemo(() => {
-    const set = new Set(items.map((i) => i.division));
-    return ['ALL', ...[...set].sort()];
+  const reasonCounts = useMemo(() => {
+    const map = new Map<string, number>();
+    for (const code of REASON_OPTIONS) map.set(code, 0);
+    for (const row of items) {
+      map.set(row.reasonCode, (map.get(row.reasonCode) ?? 0) + 1);
+    }
+    return map;
   }, [items]);
+
+  const divisions = useMemo(() => {
+    const set = new Set(
+      items.filter((i) => activeReasons.includes(i.reasonCode)).map((i) => i.division),
+    );
+    return ['ALL', ...[...set].sort()];
+  }, [items, activeReasons]);
 
   function toggleReason(code: string) {
     setReasons((prev) => {
@@ -213,12 +241,26 @@ export default function App() {
     setReasons([...REASON_OPTIONS]);
   }
 
+  function toggleAging(id: string) {
+    setAgingFilters((prev) => {
+      if (prev.includes(id)) {
+        if (prev.length === 1) return prev;
+        return prev.filter((x) => x !== id);
+      }
+      return [...prev, id];
+    });
+  }
+
+  function selectAllAging() {
+    setAgingFilters(AGING_BUCKETS.map((b) => b.id));
+  }
+
   return (
     <div className="app">
       <header className="hero">
         <p className="eyebrow">Logistics AR</p>
         <h1>Month-End Clearing</h1>
-        <p className="build-stamp">Build 2026-09-18c · aging + multi-select</p>
+        <p className="build-stamp">Build 2026-09-18e · match + oldest-first</p>
         <p className="lede">
           Decision tree by reason, RK2, threshold, and aging — header totals and by client.
         </p>
@@ -283,6 +325,30 @@ export default function App() {
               </button>
             </div>
 
+            <div className="reason-tabs">
+              <button
+                type="button"
+                className={`reason-tab${reasonTab === 'ALL' ? ' on' : ''}`}
+                onClick={() => setReasonTab('ALL')}
+              >
+                All
+                <span className="tab-count">{items.length.toLocaleString()}</span>
+              </button>
+              {REASON_OPTIONS.map((code) => (
+                <button
+                  key={code}
+                  type="button"
+                  className={`reason-tab${reasonTab === code ? ' on' : ''}`}
+                  onClick={() => setReasonTab(code)}
+                >
+                  {REASON_TAB_LABELS[code]}
+                  <span className="tab-count">
+                    {(reasonCounts.get(code) ?? 0).toLocaleString()}
+                  </span>
+                </button>
+              ))}
+            </div>
+
             <div className="controls">
               <label className="field">
                 Low-value threshold
@@ -306,26 +372,28 @@ export default function App() {
                 />
               </label>
 
-              <div className="filter-group">
-                <span className="filter-label">
-                  Reason code
-                  <button type="button" className="linkish" onClick={selectAllReasons}>
-                    All
-                  </button>
-                </span>
-                <div className="chips">
-                  {REASON_OPTIONS.map((code) => (
-                    <button
-                      key={code}
-                      type="button"
-                      className={`chip${reasons.includes(code) ? ' on' : ''}`}
-                      onClick={() => toggleReason(code)}
-                    >
-                      {code}
+              {reasonTab === 'ALL' && (
+                <div className="filter-group">
+                  <span className="filter-label">
+                    Reason code
+                    <button type="button" className="linkish" onClick={selectAllReasons}>
+                      All
                     </button>
-                  ))}
+                  </span>
+                  <div className="chips">
+                    {REASON_OPTIONS.map((code) => (
+                      <button
+                        key={code}
+                        type="button"
+                        className={`chip${reasons.includes(code) ? ' on' : ''}`}
+                        onClick={() => toggleReason(code)}
+                      >
+                        {code}
+                      </button>
+                    ))}
+                  </div>
                 </div>
-              </div>
+              )}
 
               <div className="filter-group">
                 <span className="filter-label">
@@ -359,17 +427,26 @@ export default function App() {
                 </select>
               </label>
 
-              <label className="field">
-                Aging bucket
-                <select value={agingFilter} onChange={(e) => setAgingFilter(e.target.value)}>
-                  <option value="ALL">ALL</option>
+              <div className="filter-group">
+                <span className="filter-label">
+                  Aging bucket
+                  <button type="button" className="linkish" onClick={selectAllAging}>
+                    All
+                  </button>
+                </span>
+                <div className="chips wrap">
                   {AGING_BUCKETS.map((b) => (
-                    <option key={b.id} value={b.id}>
+                    <button
+                      key={b.id}
+                      type="button"
+                      className={`chip${agingFilters.includes(b.id) ? ' on' : ''}`}
+                      onClick={() => toggleAging(b.id)}
+                    >
                       {b.label}
-                    </option>
+                    </button>
                   ))}
-                </select>
-              </label>
+                </div>
+              </div>
 
               <button
                 type="button"
@@ -381,7 +458,7 @@ export default function App() {
                     header,
                     agingHeader,
                     clients,
-                    `clearing-${threshold}-${agingDays}d.xlsx`,
+                    `clearing-${reasonTab}-${threshold}-${agingDays}d.xlsx`,
                   )
                 }
               >
@@ -411,7 +488,9 @@ export default function App() {
 
           <section className="kpis">
             <article>
-              <span>In scope</span>
+              <span>
+                {reasonTab === 'ALL' ? 'In scope' : REASON_TAB_LABELS[reasonTab]}
+              </span>
               <strong>{stats.lineCount.toLocaleString()}</strong>
               <em>{fmtMoney(stats.openAmount)}</em>
             </article>
@@ -451,7 +530,7 @@ export default function App() {
                           key={a.id}
                           className="clickable"
                           onClick={() => {
-                            setAgingFilter(a.id);
+                            setAgingFilters([a.id]);
                             setView('detail');
                           }}
                         >

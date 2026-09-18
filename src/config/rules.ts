@@ -43,6 +43,8 @@ export const PENALTY_RK2: Record<string, string> = {
 };
 
 export const ACTION_ORDER = [
+  'MATCH_ASSIGNMENT',
+  'MATCH_NET_ZERO',
   'AUTO_CLEAR_R16',
   'MATCH_OFFSET',
   'AUTO_CLEAR_WO',
