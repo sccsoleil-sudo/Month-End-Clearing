@@ -174,6 +174,7 @@ function toProposal(
     confidence,
     note,
     linkedIds,
+    sourceRow: row.sourceRow,
   };
 }
 

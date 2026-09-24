@@ -21,6 +21,8 @@ export interface LineItem {
   disputeId: string;
   disputeStatus: string;
   category: string;
+  /** Original uploaded row values keyed by source column headers (order in sourceColumns). */
+  sourceRow: Record<string, unknown>;
 }
 
 export type ActionType = (typeof ACTION_ORDER)[number];
@@ -44,6 +46,14 @@ export interface Proposal {
   confidence: 'high' | 'review' | 'hold';
   note: string;
   linkedIds: string[];
+  /** Original uploaded row — used for export column order. */
+  sourceRow: Record<string, unknown>;
+}
+
+export interface ParseResult {
+  items: LineItem[];
+  /** Uploaded file column headers in left-to-right order. */
+  sourceColumns: string[];
 }
 
 export interface ProposalOptions {

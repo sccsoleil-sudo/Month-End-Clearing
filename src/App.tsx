@@ -52,6 +52,7 @@ function exportWorkbook(
   header: ReturnType<typeof headerByAction>,
   aging: ReturnType<typeof headerByAging>,
   clients: ReturnType<typeof summarizeByClient>,
+  sourceColumns: string[],
   filename: string,
 ) {
   const wb = XLSX.utils.book_new();
@@ -104,30 +105,31 @@ function exportWorkbook(
     ),
     'By Client',
   );
-  XLSX.utils.book_append_sheet(
-    wb,
-    XLSX.utils.json_to_sheet(
-      proposals.map((p) => ({
-        Action: labelAction(p.type),
-        Confidence: p.confidence,
-        'Reason Code': p.reasonCode,
-        Division: p.division,
-        Customer: p.customer,
-        'Customer Name': p.customerName,
-        Assignment: p.assignment,
-        Amount: p.amount,
-        'Days in Arrears': p.daysInArrears ?? '',
-        Aging: AGING_BUCKETS.find((b) => b.id === agingBucketId(p.daysInArrears))?.label ?? '',
-        Category: p.category,
-        'Reference Key 2': p.referenceKey2,
-        'Dispute Status': p.disputeStatus,
-        'Item Text': p.itemText,
-        'Journal Entry': p.journalEntry,
-        Note: p.note,
-      })),
-    ),
-    'Detail',
-  );
+
+  // Detail: same columns as upload (order preserved) + Action + Aging Bucket
+  const detailRows = proposals.map((p) => {
+    const row: Record<string, unknown> = {};
+    const cols =
+      sourceColumns.length > 0
+        ? sourceColumns
+        : Object.keys(p.sourceRow ?? {});
+    for (const col of cols) {
+      const v = p.sourceRow?.[col];
+      row[col] = v instanceof Date ? v.toISOString().slice(0, 10) : (v ?? '');
+    }
+    row['Action'] = labelAction(p.type);
+    row['Aging Bucket'] =
+      AGING_BUCKETS.find((b) => b.id === agingBucketId(p.daysInArrears))?.label ??
+      '';
+    return row;
+  });
+  const detailSheet =
+    detailRows.length > 0
+      ? XLSX.utils.json_to_sheet(detailRows)
+      : XLSX.utils.aoa_to_sheet([
+          [...sourceColumns, 'Action', 'Aging Bucket'],
+        ]);
+  XLSX.utils.book_append_sheet(wb, detailSheet, 'Detail');
   XLSX.writeFile(wb, filename);
 }
 
@@ -135,6 +137,7 @@ export default function App() {
   const worker = useAnalyzeWorker();
   const [items, setItems] = useState<LineItem[]>([]);
   const [proposals, setProposals] = useState<Proposal[]>([]);
+  const [sourceColumns, setSourceColumns] = useState<string[]>([]);
   const [fileName, setFileName] = useState('');
   const [busy, setBusy] = useState(false);
   const [busyLabel, setBusyLabel] = useState('Reading workbook…');
@@ -156,6 +159,7 @@ export default function App() {
     setError('');
     setProposals([]);
     setItems([]);
+    setSourceColumns([]);
     try {
       const buffer = await file.arrayBuffer();
       setBusyLabel('Parsing & matching (UI stays responsive)…');
@@ -164,18 +168,25 @@ export default function App() {
         setError('No R02 / R03 / R11 / R16 rows found. Check the file columns.');
         setItems([]);
         setProposals([]);
+        setSourceColumns([]);
         setFileName('');
         return;
       }
       startTransition(() => {
         setItems(result.items);
         setProposals(result.proposals);
+        setSourceColumns(
+          'sourceColumns' in result && Array.isArray(result.sourceColumns)
+            ? result.sourceColumns
+            : [],
+        );
         setFileName(file.name);
       });
     } catch (e) {
       setError(e instanceof Error ? e.message : 'Failed to read workbook');
       setItems([]);
       setProposals([]);
+      setSourceColumns([]);
       setFileName('');
     } finally {
       setBusy(false);
@@ -308,7 +319,7 @@ export default function App() {
       <header className="hero">
         <p className="eyebrow">Logistics AR</p>
         <h1>Month-End Clearing</h1>
-        <p className="build-stamp">Build 2026-09-18n · mass net-zero</p>
+        <p className="build-stamp">Build 2026-09-24a · export source columns</p>
         <p className="lede">
           Decision tree by reason, RK2, threshold, and aging — header totals and by client.
         </p>
@@ -368,6 +379,7 @@ export default function App() {
                 onClick={() => {
                   setItems([]);
                   setProposals([]);
+                  setSourceColumns([]);
                   setFileName('');
                 }}
               >
@@ -508,6 +520,7 @@ export default function App() {
                     header,
                     agingHeader,
                     clients,
+                    sourceColumns,
                     `clearing-${reasonTab}-${threshold}-${agingDays}d.xlsx`,
                   )
                 }

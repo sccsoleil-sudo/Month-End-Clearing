@@ -20,7 +20,13 @@ export type ProposeRequest = {
 export type WorkerRequest = AnalyzeRequest | ProposeRequest;
 
 export type WorkerResponse =
-  | { id: number; ok: true; items: LineItem[]; proposals: Proposal[] }
+  | {
+      id: number;
+      ok: true;
+      items: LineItem[];
+      proposals: Proposal[];
+      sourceColumns: string[];
+    }
   | { id: number; ok: true; proposals: Proposal[] }
   | { id: number; ok: false; error: string };
 
@@ -30,9 +36,15 @@ ctx.onmessage = (ev: MessageEvent<WorkerRequest>) => {
   const msg = ev.data;
   try {
     if (msg.type === 'analyze') {
-      const items = parseWorkbook(msg.buffer);
+      const { items, sourceColumns } = parseWorkbook(msg.buffer);
       const proposals = buildProposals(items, msg.options);
-      const res: WorkerResponse = { id: msg.id, ok: true, items, proposals };
+      const res: WorkerResponse = {
+        id: msg.id,
+        ok: true,
+        items,
+        proposals,
+        sourceColumns,
+      };
       ctx.postMessage(res);
       return;
     }

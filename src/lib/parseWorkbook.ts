@@ -1,7 +1,7 @@
 import * as XLSX from 'xlsx';
 import { REASON_CODES } from '../config/rules';
 import { classifyRow, divisionFor, normalizeCode } from './classify';
-import type { LineItem } from './types';
+import type { LineItem, ParseResult } from './types';
 
 const SCOPE = new Set<string>([
   REASON_CODES.shortage,
@@ -66,24 +66,64 @@ function str(row: Record<string, unknown>, key: string | null): string {
   return v == null ? '' : String(v).trim();
 }
 
-export function parseWorkbook(buffer: ArrayBuffer): LineItem[] {
+/** Read sheet as objects while preserving left-to-right header order. */
+function sheetToRows(sheet: XLSX.WorkSheet): {
+  headers: string[];
+  rows: Record<string, unknown>[];
+} {
+  const matrix = XLSX.utils.sheet_to_json<unknown[]>(sheet, {
+    header: 1,
+    defval: '',
+    raw: true,
+  });
+  if (!matrix.length) return { headers: [], rows: [] };
+
+  const rawHeaders = (matrix[0] ?? []) as unknown[];
+  const headers: string[] = [];
+  for (let i = 0; i < rawHeaders.length; i++) {
+    const h = String(rawHeaders[i] ?? '').trim();
+    if (h) headers.push(h);
+    else headers.push(`Column ${i + 1}`);
+  }
+  // Drop trailing empty placeholder columns
+  while (headers.length && /^Column \d+$/.test(headers[headers.length - 1]!)) {
+    headers.pop();
+  }
+
+  const rows: Record<string, unknown>[] = [];
+  for (let r = 1; r < matrix.length; r++) {
+    const cells = (matrix[r] ?? []) as unknown[];
+    const row: Record<string, unknown> = {};
+    let any = false;
+    for (let c = 0; c < headers.length; c++) {
+      const h = headers[c]!;
+      const v = cells[c] ?? '';
+      row[h] = v;
+      if (v !== '' && v != null) any = true;
+    }
+    if (any) rows.push(row);
+  }
+  return { headers, rows };
+}
+
+export function parseWorkbook(buffer: ArrayBuffer): ParseResult {
   const wb = XLSX.read(buffer, { type: 'array', cellDates: true });
   const items: LineItem[] = [];
+  let sourceColumns: string[] = [];
   let seq = 0;
 
   for (const sheetName of wb.SheetNames) {
     const sheet = wb.Sheets[sheetName];
-    const rows = XLSX.utils.sheet_to_json<Record<string, unknown>>(sheet, {
-      defval: '',
-      raw: true,
-    });
-    if (!rows.length) continue;
+    if (!sheet) continue;
+    const { headers, rows } = sheetToRows(sheet);
+    if (!rows.length || !headers.length) continue;
 
-    const headers = Object.keys(rows[0]!);
     const keysLower = headers.map((k) => k.toLowerCase());
     if (!keysLower.some((k) => k.includes('reason')) || !keysLower.some((k) => k.includes('amount'))) {
       continue;
     }
+
+    if (!sourceColumns.length) sourceColumns = [...headers];
 
     const colMap = buildColMap(headers);
     const cols = {
@@ -118,6 +158,10 @@ export function parseWorkbook(buffer: ArrayBuffer): LineItem[] {
         daysRaw === '' || daysRaw == null ? null : toNumber(daysRaw);
       const disputeStatus = str(row, cols.disputeStatus);
 
+      // Preserve original cell values in uploaded column order
+      const sourceRow: Record<string, unknown> = {};
+      for (const h of headers) sourceRow[h] = row[h] ?? '';
+
       seq += 1;
       items.push({
         id: `${sheetName}-${seq}`,
@@ -138,9 +182,10 @@ export function parseWorkbook(buffer: ArrayBuffer): LineItem[] {
         disputeId: str(row, cols.disputeId),
         disputeStatus,
         category: classifyRow(reasonCode, referenceKey2, itemText, assignment),
+        sourceRow,
       });
     }
   }
 
-  return items;
+  return { items, sourceColumns };
 }
